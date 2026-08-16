@@ -428,8 +428,10 @@ import json
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -7129,6 +7131,20 @@ def _linux_restricts_unprivileged_userns() -> bool:
 
 
 _CLONE_NEWUSER = 0x10000000
+_LINUX_USERNS_PROBE_TIMEOUT_SECONDS = 1.0
+_LINUX_USERNS_PROBE_POLL_SECONDS = 0.01
+
+
+def _reap_linux_userns_probe(pid: int) -> None:
+    """Best-effort reap of a userns probe after it is killed or interrupted."""
+    while True:
+        try:
+            os.waitpid(pid, 0)
+            return
+        except InterruptedError:
+            continue
+        except (ChildProcessError, OSError):
+            return
 
 
 def _linux_userns_sandbox_available() -> bool:
@@ -7144,7 +7160,9 @@ def _linux_userns_sandbox_available() -> bool:
     without CONFIG_USER_NS, and container seccomp policy all block it too.
 
     Mirror Chromium's own probe (sandbox::Credentials::CanCreateProcessInNewUserNS):
-    fork and try ``unshare(CLONE_NEWUSER)``. Fail closed if we cannot probe.
+    fork and try ``unshare(CLONE_NEWUSER)``. Fail closed if we cannot probe,
+    and bound the parent wait so a stuck kernel/seccomp path cannot hang the
+    Desktop launcher.
     """
     if sys.platform != "linux":
         return False
@@ -7154,8 +7172,9 @@ def _linux_userns_sandbox_available() -> bool:
     import ctypes
 
     try:
-        # Load libc before forking so the child only makes one syscall.
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # Resolve the current process' C runtime before forking. CDLL(None)
+        # works on glibc and musl and keeps the child path to one syscall.
+        libc = ctypes.CDLL(None, use_errno=True)
         pid = os.fork()
     except (OSError, AttributeError):
         return False
@@ -7165,11 +7184,27 @@ def _linux_userns_sandbox_available() -> bool:
         except BaseException:
             os._exit(1)
         os._exit(0 if rc == 0 else 1)
-    try:
-        _, status = os.waitpid(pid, 0)
-    except OSError:
-        return False
-    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+    deadline = time.monotonic() + _LINUX_USERNS_PROBE_TIMEOUT_SECONDS
+    while True:
+        try:
+            waited_pid, status = os.waitpid(pid, os.WNOHANG)
+        except InterruptedError:
+            continue
+        except OSError:
+            return False
+        if waited_pid == pid:
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        if time.monotonic() >= deadline:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            _reap_linux_userns_probe(pid)
+            return False
+        time.sleep(_LINUX_USERNS_PROBE_POLL_SECONDS)
 
 
 def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> bool:
@@ -7600,6 +7635,9 @@ def cmd_gui(args: argparse.Namespace):
                 print("✗ Electron's setuid sandbox helper is not configured and this host does not")
                 print("  allow unprivileged user namespaces, so Chromium would abort at startup.")
                 print(f"  Fix with: sudo chown root:root {sandbox} && sudo chmod 4755 {sandbox}")
+            else:
+                print("✗ Electron's Linux sandbox helper is missing or is not a regular file;")
+                print("  refusing to launch without a verifiable sandbox path.")
             sys.exit(1)
 
     launch_command.extend(config_electron_flags)

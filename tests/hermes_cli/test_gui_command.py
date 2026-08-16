@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -786,7 +787,7 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
 # userns-sandbox continuation added for non-TTY launch contexts.
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox gate")
+@pytest.mark.linux_only
 def test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
@@ -810,7 +811,7 @@ def test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted(tmp_path, 
     assert mock_run.call_args.args[0] == [str(packaged_exe), "--no-sandbox"]
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox gate")
+@pytest.mark.linux_only
 def test_gui_continues_with_userns_sandbox_when_helper_unconfigurable(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
@@ -835,7 +836,7 @@ def test_gui_continues_with_userns_sandbox_when_helper_unconfigurable(tmp_path, 
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox gate")
+@pytest.mark.linux_only
 def test_gui_linux_exits_when_userns_unavailable_and_helper_unconfigurable(tmp_path, monkeypatch):
     """linux-hardened / unprivileged_userns_clone=0: neither sandbox works."""
     root = _make_desktop_tree(tmp_path)
@@ -857,8 +858,8 @@ def test_gui_linux_exits_when_userns_unavailable_and_helper_unconfigurable(tmp_p
     mock_run.assert_not_called()
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox gate")
-def test_gui_linux_exits_when_sandbox_helper_missing_even_with_userns(tmp_path, monkeypatch):
+@pytest.mark.linux_only
+def test_gui_linux_exits_when_sandbox_helper_missing_even_with_userns(tmp_path, monkeypatch, capsys):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     packaged_exe = _make_packaged_executable(root, monkeypatch)
@@ -876,9 +877,10 @@ def test_gui_linux_exits_when_sandbox_helper_missing_even_with_userns(tmp_path, 
 
     assert exc.value.code == 1
     mock_run.assert_not_called()
+    assert "missing or is not a regular file" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux sandbox gate")
+@pytest.mark.linux_only
 def test_gui_electron_disable_sandbox_still_wins_on_unrestricted_host(tmp_path, monkeypatch):
     """The explicit env override must beat the userns continuation."""
     root = _make_desktop_tree(tmp_path)
@@ -915,8 +917,45 @@ def test_linux_userns_probe_skips_fork_when_apparmor_restricted(monkeypatch):
         assert cli_main._linux_userns_sandbox_available() is False
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="needs os.fork")
+@pytest.mark.linux_only
 def test_linux_userns_probe_fails_closed_on_fork_error(monkeypatch):
     monkeypatch.setattr(cli_main, "_linux_restricts_unprivileged_userns", lambda: False)
     with patch("hermes_cli.main.os.fork", side_effect=OSError("no fork")):
         assert cli_main._linux_userns_sandbox_available() is False
+
+
+@pytest.mark.linux_only
+def test_linux_userns_probe_uses_process_libc(monkeypatch):
+    monkeypatch.setattr(cli_main, "_linux_restricts_unprivileged_userns", lambda: False)
+    with patch("ctypes.CDLL", side_effect=OSError("stop after resolution")) as mock_cdll:
+        assert cli_main._linux_userns_sandbox_available() is False
+
+    mock_cdll.assert_called_once_with(None, use_errno=True)
+
+
+@pytest.mark.linux_only
+def test_linux_userns_probe_retries_interrupted_wait(monkeypatch):
+    monkeypatch.setattr(cli_main, "_linux_restricts_unprivileged_userns", lambda: False)
+    child_pid = 4321
+
+    with patch("hermes_cli.main.os.fork", return_value=child_pid), \
+         patch("hermes_cli.main.os.waitpid", side_effect=[InterruptedError, (child_pid, 0)]) as mock_waitpid:
+        assert cli_main._linux_userns_sandbox_available() is True
+
+    assert mock_waitpid.call_count == 2
+
+
+@pytest.mark.linux_only
+def test_linux_userns_probe_times_out_kills_and_reaps_child(monkeypatch):
+    monkeypatch.setattr(cli_main, "_linux_restricts_unprivileged_userns", lambda: False)
+    child_pid = 4321
+
+    with patch("hermes_cli.main.os.fork", return_value=child_pid), \
+         patch("hermes_cli.main.os.waitpid", side_effect=[(0, 0), (child_pid, 9)]) as mock_waitpid, \
+         patch("hermes_cli.main.os.kill") as mock_kill, \
+         patch("hermes_cli.main.time.monotonic", side_effect=[10.0, 11.1]), \
+         patch("hermes_cli.main.time.sleep"):
+        assert cli_main._linux_userns_sandbox_available() is False
+
+    mock_kill.assert_called_once_with(child_pid, signal.SIGKILL)
+    assert mock_waitpid.call_count == 2
